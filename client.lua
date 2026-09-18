@@ -37,7 +37,9 @@ end
 
 local function removeCrateTarget()
     if targetNetId and targetNetId > 0 then
-        exports.ox_target:removeEntity(targetNetId, 'cb_airdrop_loot')
+        if pickup and DoesEntityExist(pickup) then
+        exports.ox_target:removeLocalEntity(pickup, 'cb_airdrop_loot')
+    end
     end
     targetNetId = nil
 end
@@ -68,14 +70,19 @@ local function registerCrateTarget(netId)
     pickup = entity
     pickupNetId = netId
 
-    exports.ox_target:addEntity(netId, {
+    -- Register the ACTUAL crate entity as a local ox_target target.
+    -- No zone, marker or replacement prop is created.
+    exports.ox_target:addLocalEntity(entity, {
         {
             name = 'cb_airdrop_loot',
             icon = 'fa-solid fa-box-open',
             iconColor = '#c9a227',
             label = 'Search supply crate',
             distance = Config.LootDistance,
-            onSelect = function()
+            onSelect = function(data)
+                if data and data.entity and DoesEntityExist(data.entity) then
+                    pickup = data.entity
+                end
                 StartLoot()
             end
         }
