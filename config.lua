@@ -113,7 +113,7 @@ Config.CrateModel = 'prop_box_wood02a_pu'
 Config.ParachuteModel = 'p_cargo_chute_s'
 
 -- Object used by ox_target for searching the crate.
-Config.PickupModel = 'ex_prop_adv_case_sm'
+Config.PickupModel = 'prop_box_wood02a_pu'
 
 -- ============================================================================
 -- LOOT

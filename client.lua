@@ -17,8 +17,7 @@ local requiredModels = {
     Config.CrateModel,
     Config.ParachuteModel,
     Config.AircraftModel,
-    Config.PilotModel,
-    Config.PickupModel
+    Config.PilotModel
 }
 
 -- ============================================================================
@@ -612,16 +611,10 @@ function CrateDrop()
             Config.ParachuteModel
         )
 
-    local pickupModel =
-        requestModel(
-            Config.PickupModel
-        )
-
     if not aircraftModel
         or not pilotModel
         or not crateModel
-        or not parachuteModel
-        or not pickupModel then
+        or not parachuteModel then
 
         TriggerServerEvent(
             'cb_airdrop:server:dropFailed'
@@ -1128,13 +1121,21 @@ function CrateDrop()
             local distanceToGround =
                 coords.z - targetZ
 
-            if distanceToGround <= 1.0 then
-                SetEntityCoords(
+            -- ---------------------------------------------------------------
+            -- FINAL APPROACH
+            -- ---------------------------------------------------------------
+            --
+            -- Do NOT snap from up to 1 metre above the ground.
+            -- Once the crate is close enough, continue moving it down
+            -- progressively and only lock it when it is practically
+            -- touching the ground.
+            --
+            if distanceToGround <= 0.10 then
+                SetEntityCoordsNoOffset(
                     crate,
                     coords.x,
                     coords.y,
                     targetZ,
-                    false,
                     false,
                     false,
                     false
@@ -1164,14 +1165,33 @@ function CrateDrop()
                 break
             end
 
-            local delta =
+            -- ---------------------------------------------------------------
+            -- CONTROLLED DESCENT
+            -- ---------------------------------------------------------------
+
+            local step =
+                descentSpeed * 0.05
+
+            -- Slow the final approach progressively.
+            if distanceToGround < 3.0 then
+                step =
+                    math.min(
+                        step,
+                        math.max(
+                            distanceToGround * 0.35,
+                            0.015
+                        )
+                    )
+            end
+
+            step =
                 math.min(
-                    descentSpeed * 0.05,
+                    step,
                     distanceToGround
                 )
 
             local nextZ =
-                coords.z - delta
+                coords.z - step
 
             SetEntityCoordsNoOffset(
                 crate,
@@ -1242,37 +1262,40 @@ function CrateDrop()
                 ) +
                 getGroundDistance()
 
-            SetEntityCoords(
-                crate,
-                coords.x,
-                coords.y,
-                targetZ,
-                false,
-                false,
-                false,
-                false
-            )
-
-            SetEntityVelocity(
-                crate,
-                0.0,
-                0.0,
-                0.0
-            )
-
-            FreezeEntityPosition(
-                crate,
-                true
-            )
-
-            landingCoords =
-                vector3(
+            -- Only perform the final correction if we are already
+            -- essentially at the ground.
+            if math.abs(coords.z - targetZ) <= 0.25 then
+                SetEntityCoordsNoOffset(
+                    crate,
                     coords.x,
                     coords.y,
-                    targetZ
+                    targetZ,
+                    false,
+                    false,
+                    false
                 )
 
-            landed = true
+                SetEntityVelocity(
+                    crate,
+                    0.0,
+                    0.0,
+                    0.0
+                )
+
+                FreezeEntityPosition(
+                    crate,
+                    true
+                )
+
+                landingCoords =
+                    vector3(
+                        coords.x,
+                        coords.y,
+                        targetZ
+                    )
+
+                landed = true
+            end
         end
     end
 
@@ -1288,9 +1311,9 @@ function CrateDrop()
         return
     end
 
-    -- ========================================================================
+    -- =========================================================================
     -- PARACHUTE DETACH
-    -- ========================================================================
+    -- =========================================================================
 
     if DoesEntityExist(parachute) then
         DetachEntity(
@@ -1306,9 +1329,9 @@ function CrateDrop()
         parachute = nil
     end
 
-    -- ========================================================================
+    -- =========================================================================
     -- FINAL CRATE POSITION
-    -- ========================================================================
+    -- =========================================================================
 
     if DoesEntityExist(crate) then
         local coords =
@@ -1328,24 +1351,34 @@ function CrateDrop()
                 ) +
                 getGroundDistance()
 
-            SetEntityCoords(
-                crate,
-                coords.x,
-                coords.y,
-                finalZ,
-                false,
-                false,
-                false,
-                false
-            )
-
-            landingCoords =
-                vector3(
+            -- This is only a tiny final correction.
+            -- The crate has already been brought down progressively.
+            if math.abs(coords.z - finalZ) <= 0.25 then
+                SetEntityCoordsNoOffset(
+                    crate,
                     coords.x,
                     coords.y,
-                    finalZ
+                    finalZ,
+                    false,
+                    false,
+                    false
                 )
+
+                landingCoords =
+                    vector3(
+                        coords.x,
+                        coords.y,
+                        finalZ
+                    )
+            end
         end
+
+        SetEntityVelocity(
+            crate,
+            0.0,
+            0.0,
+            0.0
+        )
 
         FreezeEntityPosition(
             crate,
@@ -1353,28 +1386,21 @@ function CrateDrop()
         )
     end
 
-    -- ========================================================================
-    -- REMOVE PHYSICAL CRATE
-    -- ========================================================================
+    -- =========================================================================
+    -- FINAL PICKUP ENTITY
+    -- =========================================================================
+    --
+    -- IMPORTANT:
+    -- We DO NOT delete the crate.
+    --
+    -- The crate that descended with the parachute is now the permanent
+    -- interactable supply crate.
+    --
+    -- This prevents the visual prop from changing when the drop lands.
+    --
 
-    if DoesEntityExist(crate) then
-        DeleteEntity(crate)
-        crate = nil
-    end
-
-    -- ========================================================================
-    -- CREATE FINAL PICKUP
-    -- ========================================================================
-
-    pickup = CreateObject(
-        pickupModel,
-        landingCoords.x,
-        landingCoords.y,
-        landingCoords.z,
-        true,
-        true,
-        true
-    )
+    pickup = crate
+    crate = nil
 
     if not DoesEntityExist(pickup) then
         CleanupDropEntities()
@@ -1394,42 +1420,10 @@ function CrateDrop()
         true
     )
 
-    -- Position the visual pickup against the actual ground.
-    local foundPickupGround, pickupGroundZ =
-        getGroundHeight(
-            landingCoords,
-            pickup
-        )
-
-    if foundPickupGround then
-        local pickupZ =
-            pickupGroundZ +
-            getModelGroundOffset(
-                Config.PickupModel
-            )
-
-        SetEntityCoords(
-            pickup,
-            landingCoords.x,
-            landingCoords.y,
-            pickupZ,
-            false,
-            false,
-            false,
-            false
-        )
-    else
-        SetEntityCoords(
-            pickup,
-            landingCoords.x,
-            landingCoords.y,
-            landingCoords.z,
-            false,
-            false,
-            false,
-            false
-        )
-    end
+    FreezeEntityPosition(
+        pickup,
+        true
+    )
 
     SetEntityCollision(
         pickup,
@@ -1437,36 +1431,18 @@ function CrateDrop()
         true
     )
 
-    FreezeEntityPosition(
+    -- =========================================================================
+    -- OX TARGET - LOCAL ENTITY
+    -- =========================================================================
+    --
+    -- The actual landed crate is registered directly with ox_target.
+    --
+    -- addLocalEntity is supported by ox_target for a specific entity handle.
+    --
+
+    exports.ox_target:addLocalEntity(
         pickup,
-        true
-    )
-
-    -- =========================================================================
-    -- OX TARGET - SPHERE ZONE
-    -- =========================================================================
-    --
-    -- The visual pickup remains the object.
-    -- Interaction is handled by an ox_target sphere positioned exactly
-    -- at the final landing coordinates. This avoids depending on the
-    -- pickup model being hit by the target raycast.
-    --
-    -- ox_target officially supports addSphereZone and returns a zone id
-    -- which can later be removed with removeZone.
-    --
-
-    pickupZone = exports.ox_target:addSphereZone({
-        name = 'cb_airdrop_loot_zone',
-        coords = vector3(
-            landingCoords.x,
-            landingCoords.y,
-            landingCoords.z
-        ),
-        radius = 2.0,
-        debug = Config.Debug,
-        drawSprite = Config.Debug,
-
-        options = {
+        {
             {
                 name = 'cb_airdrop_loot',
                 icon = 'fa-solid fa-box-open',
@@ -1474,8 +1450,51 @@ function CrateDrop()
                 label = 'Search supply crate',
                 distance = Config.LootDistance,
 
+                canInteract = function(entity)
+                    return entity == pickup
+                        and dropState == 'ready'
+                        and DoesEntityExist(pickup)
+                end,
+
+                onSelect = function(data)
+                    StartLoot()
+                end
+            }
+        }
+    )
+
+    -- =========================================================================
+    -- OX TARGET - SPHERE ZONE BACKUP
+    -- =========================================================================
+    --
+    -- The local entity target is the primary interaction.
+    --
+    -- This sphere is intentionally kept as a backup in case the model
+    -- geometry/raycast does not behave correctly with the custom prop.
+    --
+
+    pickupZone = exports.ox_target:addSphereZone({
+        name = 'cb_airdrop_loot_zone',
+        coords = vector3(
+            landingCoords.x,
+            landingCoords.y,
+            landingCoords.z + 0.35
+        ),
+        radius = 2.0,
+        debug = Config.Debug,
+        drawSprite = Config.Debug,
+
+        options = {
+            {
+                name = 'cb_airdrop_loot_zone_option',
+                icon = 'fa-solid fa-box-open',
+                iconColor = '#c9a227',
+                label = 'Search supply crate',
+                distance = Config.LootDistance,
+
                 canInteract = function()
                     return dropState == 'ready'
+                        and DoesEntityExist(pickup)
                 end,
 
                 onSelect = function()
@@ -1651,7 +1670,7 @@ RegisterNetEvent(
             dropBlip
         )
 
-        -- Remove the ox_target interaction zone first.
+        -- Remove the sphere zone.
         if pickupZone then
             exports.ox_target:removeZone(
                 pickupZone
@@ -1660,7 +1679,13 @@ RegisterNetEvent(
             pickupZone = nil
         end
 
+        -- Remove the local entity target.
         if DoesEntityExist(pickup) then
+            exports.ox_target:removeLocalEntity(
+                pickup,
+                'cb_airdrop_loot'
+            )
+
             DeleteEntity(
                 pickup
             )
@@ -1681,12 +1706,21 @@ RegisterNetEvent(
 -- ============================================================================
 
 function CleanupDropEntities()
+    -- Remove sphere zone.
     if pickupZone then
         exports.ox_target:removeZone(
             pickupZone
         )
 
         pickupZone = nil
+    end
+
+    -- Remove local entity target.
+    if DoesEntityExist(pickup) then
+        exports.ox_target:removeLocalEntity(
+            pickup,
+            'cb_airdrop_loot'
+        )
     end
 
     if DoesEntityExist(parachute) then
