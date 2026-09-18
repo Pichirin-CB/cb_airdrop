@@ -1,397 +1,1783 @@
 local currentZone = nil
+
 local zoneBlip = nil
 local dropBlip = nil
 local policeBlip = nil
+
 local dropState = 'idle'
+
 local aircraft = nil
 local pilot = nil
 local crate = nil
 local parachute = nil
 local pickup = nil
 local pickupNetId = nil
-local targetNetId = nil
 
-local function notify(message, type)
-    lib.notify({ title = 'AIR DROP', description = message, type = type or 'inform', duration = 5000, position = 'top-right' })
+local requiredModels = {
+    Config.CrateModel,
+    Config.ParachuteModel,
+    Config.AircraftModel,
+    Config.PilotModel
+}
+
+-- ============================================================================
+-- HELPERS
+-- ============================================================================
+
+local function notify(description, type)
+    lib.notify({
+        title = 'AIR DROP',
+        description = description,
+        type = type or 'inform',
+        duration = 5000,
+        position = 'top-right'
+    })
 end
+
 
 local function requestModel(model)
     local hash = type(model) == 'number' and model or joaat(model)
-    if HasModelLoaded(hash) then return hash end
+
+    if HasModelLoaded(hash) then
+        return hash
+    end
+
     RequestModel(hash)
+
     local timeout = GetGameTimer() + 10000
+
     while not HasModelLoaded(hash) do
         Wait(10)
+
         if GetGameTimer() > timeout then
-            print(('[cb_airdrop] Failed to load model: %s'):format(tostring(model)))
+            print(
+                ('[cb_airdrop] Failed to load model: %s'):format(
+                    tostring(model)
+                )
+            )
+
             return nil
         end
     end
+
     return hash
 end
 
+
+local function releaseModels()
+    for i = 1, #requiredModels do
+        local model = requiredModels[i]
+
+        if model then
+            local hash = type(model) == 'number'
+                and model
+                or joaat(model)
+
+            SetModelAsNoLongerNeeded(hash)
+        end
+    end
+end
+
+
 local function removeBlip(blip)
-    if blip and DoesBlipExist(blip) then RemoveBlip(blip) end
+    if blip and DoesBlipExist(blip) then
+        RemoveBlip(blip)
+    end
+
     return nil
 end
 
-local function removeCrateTarget()
-    if targetNetId and targetNetId > 0 then
-        if pickup and DoesEntityExist(pickup) then
-        exports.ox_target:removeLocalEntity(pickup, 'cb_airdrop_loot')
-    end
-    end
-    targetNetId = nil
-end
 
-local function registerCrateTarget(netId)
-    netId = tonumber(netId)
-    if not netId or netId <= 0 then return end
-    if targetNetId == netId then return end
+-- ============================================================================
+-- OX TARGET
+-- ============================================================================
 
-    removeCrateTarget()
+local function registerPickupTarget(entity)
+    if not entity
+        or entity == 0
+        or not DoesEntityExist(entity) then
 
-    local timeout = GetGameTimer() + 10000
-    local entity = 0
-
-    while GetGameTimer() < timeout do
-        if NetworkDoesEntityExistWithNetworkId(netId) then
-            entity = NetworkGetEntityFromNetworkId(netId)
-            if entity and entity ~= 0 and DoesEntityExist(entity) then break end
-        end
-        Wait(100)
+        return false
     end
 
-    if entity == 0 or not DoesEntityExist(entity) then
-        print(('[cb_airdrop] Could not resolve crate NetID %s.'):format(netId))
-        return
+    local netId =
+        NetworkGetNetworkIdFromEntity(entity)
+
+    if not netId or netId == 0 then
+        print(
+            '[cb_airdrop] Failed to get network ID for supply crate.'
+        )
+
+        return false
     end
 
-    pickup = entity
     pickupNetId = netId
 
-    -- Register the ACTUAL crate entity as a local ox_target target.
-    -- No zone, marker or replacement prop is created.
-    exports.ox_target:addLocalEntity(entity, {
-        {
-            name = 'cb_airdrop_loot',
-            icon = 'fa-solid fa-box-open',
-            iconColor = '#c9a227',
-            label = 'Search supply crate',
-            distance = Config.LootDistance,
-            onSelect = function(data)
-                if data and data.entity and DoesEntityExist(data.entity) then
-                    pickup = data.entity
-                end
-                StartLoot()
-            end
-        }
-    })
+    pcall(function()
+        exports.ox_target:removeEntity(
+            netId,
+            'cb_airdrop_loot'
+        )
+    end)
 
-    targetNetId = netId
+    exports.ox_target:addEntity(
+        netId,
+        {
+            {
+                name = 'cb_airdrop_loot',
+                icon = 'fa-solid fa-box-open',
+                iconColor = '#c9a227',
+                label = 'Search supply crate',
+                distance = Config.LootDistance,
+
+                canInteract = function()
+                    return dropState == 'ready'
+                        and DoesEntityExist(entity)
+                end,
+
+                onSelect = function(data)
+                    StartLoot(data.entity)
+                end
+            }
+        }
+    )
+
+    return true
 end
 
-local function getGroundZ(coords)
-    local found, z = GetGroundZFor_3dCoord(coords.x, coords.y, coords.z + 100.0, false)
-    if found then return true, z end
 
-    local ray = StartShapeTestRay(coords.x, coords.y, coords.z + 100.0, coords.x, coords.y, coords.z - 1000.0, 1, 0, 7)
+local function removePickupTarget()
+    if pickupNetId then
+        pcall(function()
+            exports.ox_target:removeEntity(
+                pickupNetId,
+                'cb_airdrop_loot'
+            )
+        end)
+    end
+
+    pickupNetId = nil
+end
+
+
+-- ============================================================================
+-- GROUND / MODEL HELPERS
+-- ============================================================================
+
+local function getGroundHeight(coords, ignoreEntity)
+    local startZ = coords.z + 100.0
+    local endZ = coords.z - 1000.0
+
+    local ray = StartShapeTestRay(
+        coords.x,
+        coords.y,
+        startZ,
+        coords.x,
+        coords.y,
+        endZ,
+        1,
+        ignoreEntity or 0,
+        7
+    )
+
     local timeout = GetGameTimer() + 1000
+
     while GetGameTimer() < timeout do
-        local result, hit, endCoords = GetShapeTestResult(ray)
+        local result, hit, endCoords =
+            GetShapeTestResult(ray)
+
         if result == 2 then
-            if hit then return true, endCoords.z end
+            if hit then
+                return true, endCoords.z, 0
+            end
+
             break
         end
+
         Wait(0)
     end
-    return false, nil
+
+    local foundGround, groundZ =
+        GetGroundZFor_3dCoord(
+            coords.x,
+            coords.y,
+            coords.z + 100.0,
+            false
+        )
+
+    if foundGround then
+        return true, groundZ, 0
+    end
+
+    return false, nil, 0
 end
 
-local function getNetworkId(entity)
-    if not DoesEntityExist(entity) then return 0 end
-    local timeout = GetGameTimer() + 5000
-    while GetGameTimer() < timeout do
-        if not NetworkGetEntityIsNetworked(entity) then NetworkRegisterEntityAsNetworked(entity) end
-        local netId = NetworkGetNetworkIdFromEntity(entity)
-        if netId and netId > 0 then
-            SetNetworkIdCanMigrate(netId, true)
-            return netId
-        end
-        Wait(50)
+
+local function getModelGroundOffset(model)
+    local hash = type(model) == 'number'
+        and model
+        or joaat(model)
+
+    local minDim, maxDim =
+        GetModelDimensions(hash)
+
+    if not minDim or not maxDim then
+        return 0.05
     end
-    return 0
+
+    local offset = -minDim.z
+
+    if offset < 0.0 then
+        offset = 0.0
+    end
+
+    return offset + 0.03
 end
+
+
+local function getDropHeight()
+    return Config.PlaneAltitude or 500.0
+end
+
+
+local function getPlaneSpeed()
+    return Config.PlaneSpeed or 60.0
+end
+
+
+local function getPlaneSpawnDistance()
+    return Config.PlaneSpawnDistance or 400.0
+end
+
+
+local function getPlaneTimeout()
+    return Config.PlaneTimeoutSeconds or 60
+end
+
+
+local function getGroundDistance()
+    return Config.CrateGroundDistance or 0.05
+end
+
+
+-- ============================================================================
+-- ZONE BLIP
+-- ============================================================================
 
 local function createZoneBlip()
     zoneBlip = removeBlip(zoneBlip)
-    if not Config.Blips.zone.enabled or not currentZone then return end
-    zoneBlip = AddBlipForRadius(currentZone.coords.x, currentZone.coords.y, currentZone.coords.z, currentZone.radius)
-    SetBlipSprite(zoneBlip, Config.Blips.zone.sprite)
-    SetBlipColour(zoneBlip, currentZone.color or Config.Blips.zone.colour)
-    SetBlipAlpha(zoneBlip, Config.Blips.zone.alpha)
+
+    if not Config.Blips.zone.enabled then
+        return
+    end
+
+    if not currentZone then
+        return
+    end
+
+    zoneBlip = AddBlipForRadius(
+        currentZone.coords.x,
+        currentZone.coords.y,
+        currentZone.coords.z,
+        currentZone.radius
+    )
+
+    SetBlipSprite(
+        zoneBlip,
+        Config.Blips.zone.sprite
+    )
+
+    SetBlipColour(
+        zoneBlip,
+        currentZone.color or Config.Blips.zone.colour
+    )
+
+    SetBlipAlpha(
+        zoneBlip,
+        Config.Blips.zone.alpha
+    )
 end
+
+
+-- ============================================================================
+-- DROP BLIP
+-- ============================================================================
 
 local function createDropBlip(coords)
     dropBlip = removeBlip(dropBlip)
-    if not Config.Blips.drop.enabled or not coords then return end
-    dropBlip = AddBlipForCoord(coords.x, coords.y, coords.z)
-    SetBlipSprite(dropBlip, Config.Blips.drop.sprite)
-    SetBlipColour(dropBlip, Config.Blips.drop.colour)
-    SetBlipScale(dropBlip, Config.Blips.drop.scale)
-    if Config.Blips.drop.route then
-        SetBlipRoute(dropBlip, true)
-        SetBlipRouteColour(dropBlip, Config.Blips.drop.colour)
+
+    if not Config.Blips.drop.enabled then
+        return
     end
+
+    if not coords then
+        return
+    end
+
+    dropBlip = AddBlipForCoord(
+        coords.x,
+        coords.y,
+        coords.z
+    )
+
+    SetBlipSprite(
+        dropBlip,
+        Config.Blips.drop.sprite
+    )
+
+    SetBlipColour(
+        dropBlip,
+        Config.Blips.drop.colour
+    )
+
+    SetBlipScale(
+        dropBlip,
+        Config.Blips.drop.scale
+    )
+
+    if Config.Blips.drop.route then
+        SetBlipRoute(
+            dropBlip,
+            true
+        )
+
+        SetBlipRouteColour(
+            dropBlip,
+            Config.Blips.drop.colour
+        )
+    end
+
     BeginTextCommandSetBlipName('STRING')
-    AddTextComponentString(Config.Blips.drop.name)
+
+    AddTextComponentString(
+        Config.Blips.drop.name
+    )
+
     EndTextCommandSetBlipName(dropBlip)
 end
 
-RegisterNetEvent('cb_airdrop:client:setZone', function(zone)
-    currentZone = zone
-    createZoneBlip()
-end)
 
-RegisterNetEvent('cb_airdrop:client:setDropState', function(state)
-    dropState = state
-    if state == 'idle' or state == 'claimed' or state == 'failed' then
-        dropBlip = removeBlip(dropBlip)
+-- ============================================================================
+-- POLICE BLIP
+-- ============================================================================
+
+RegisterNetEvent(
+    'cb_airdrop:client:setPoliceBlip',
+    function(coords)
+        policeBlip = removeBlip(policeBlip)
+
+        if not coords then
+            return
+        end
+
+        policeBlip = AddBlipForCoord(
+            coords.x,
+            coords.y,
+            coords.z
+        )
+
+        SetBlipSprite(
+            policeBlip,
+            Config.Blips.police.sprite
+        )
+
+        SetBlipColour(
+            policeBlip,
+            Config.Blips.police.colour
+        )
+
+        SetBlipScale(
+            policeBlip,
+            Config.Blips.police.scale
+        )
+
+        SetBlipAsShortRange(false)
+
+        PulseBlip(policeBlip)
+
+        BeginTextCommandSetBlipName('STRING')
+
+        AddTextComponentString(
+            Config.Blips.police.name
+        )
+
+        EndTextCommandSetBlipName(policeBlip)
     end
-    if state == 'ready' then
-        notify(Config.Notifications.crateReady, 'success')
-    elseif state == 'failed' then
-        notify(Config.Notifications.planeCrashed, 'error')
+)
+
+
+RegisterNetEvent(
+    'cb_airdrop:client:removePoliceBlip',
+    function()
+        policeBlip = removeBlip(policeBlip)
     end
-end)
+)
 
-RegisterNetEvent('cb_airdrop:client:setDropBlip', function(coords)
-    createDropBlip(coords)
-end)
 
-RegisterNetEvent('cb_airdrop:client:registerDropEntity', function(netId)
-    registerCrateTarget(netId)
-end)
+-- ============================================================================
+-- NOTIFICATIONS
+-- ============================================================================
 
-RegisterNetEvent('cb_airdrop:client:notify', function(message, type)
-    notify(message, type)
-end)
-
-RegisterNetEvent('cb_airdrop:client:setPoliceBlip', function(coords)
-    policeBlip = removeBlip(policeBlip)
-    if not coords then return end
-    policeBlip = AddBlipForCoord(coords.x, coords.y, coords.z)
-    SetBlipSprite(policeBlip, Config.Blips.police.sprite)
-    SetBlipColour(policeBlip, Config.Blips.police.colour)
-    SetBlipScale(policeBlip, Config.Blips.police.scale)
-    SetBlipAsShortRange(false)
-    PulseBlip(policeBlip)
-    BeginTextCommandSetBlipName('STRING')
-    AddTextComponentString(Config.Blips.police.name)
-    EndTextCommandSetBlipName(policeBlip)
-end)
-
-RegisterNetEvent('cb_airdrop:client:removePoliceBlip', function()
-    policeBlip = removeBlip(policeBlip)
-end)
-
-function StartLoot()
-    if dropState ~= 'ready' or not pickupNetId then return end
-    if not pickup or not DoesEntityExist(pickup) then return end
-
-    local accepted = lib.callback.await('cb_airdrop:server:beginLoot', false)
-    if not accepted then
-        notify(Config.Notifications.crateAlreadyLooted, 'error')
-        return
+RegisterNetEvent(
+    'cb_airdrop:client:notify',
+    function(message, type)
+        notify(
+            message,
+            type
+        )
     end
+)
 
-    local completed = lib.progressBar({
-        duration = Config.LootDuration,
-        label = 'Searching survival supplies...',
-        useWhileDead = false,
-        canCancel = true,
-        disable = { move = true, car = true, combat = true, sprint = true },
-        anim = { dict = 'anim@amb@clubhouse@tutorial@bkr_tut_ig3@', clip = 'machinic_loop_mechandplayer', flag = 49 }
-    })
 
-    if not completed then
-        TriggerServerEvent('cb_airdrop:server:cancelLoot')
-        notify(Config.Notifications.lootCancelled, 'error')
-        return
+-- ============================================================================
+-- ZONE
+-- ============================================================================
+
+RegisterNetEvent(
+    'cb_airdrop:client:setZone',
+    function(zone)
+        currentZone = zone
+
+        createZoneBlip()
     end
+)
 
-    TriggerServerEvent('cb_airdrop:server:completeLoot')
-end
-
-RegisterNetEvent('cb_airdrop:client:removeDrop', function()
-    removeCrateTarget()
-    if DoesEntityExist(pickup) then DeleteEntity(pickup) end
-    if DoesEntityExist(crate) then DeleteEntity(crate) end
-    if DoesEntityExist(parachute) then DeleteEntity(parachute) end
-    pickup = nil
-    pickupNetId = nil
-    crate = nil
-    parachute = nil
-    dropBlip = removeBlip(dropBlip)
-end)
-
-RegisterNetEvent('cb_airdrop:client:startFlare', function()
-    if dropState ~= 'incoming' or not currentZone then return end
-
-    notify(Config.Notifications.planeIncoming, 'inform')
-
-    CreateThread(function()
-        local aircraftModel = requestModel(Config.AircraftModel)
-        local pilotModel = requestModel(Config.PilotModel)
-        local crateModel = requestModel(Config.CrateModel)
-        local parachuteModel = requestModel(Config.ParachuteModel)
-
-        if not aircraftModel or not pilotModel or not crateModel or not parachuteModel then
-            TriggerServerEvent('cb_airdrop:server:dropFailed')
-            return
-        end
-
-        local zone = currentZone
-        local heading = math.random(0, 359)
-        local rad = math.rad(heading)
-        local spawnDistance = Config.PlaneSpawnDistance
-        local spawn = vector3(zone.coords.x - math.cos(rad) * spawnDistance, zone.coords.y - math.sin(rad) * spawnDistance, zone.coords.z + Config.PlaneAltitude)
-
-        aircraft = CreateVehicle(aircraftModel, spawn.x, spawn.y, spawn.z, heading, true, true)
-        if aircraft == 0 then
-            TriggerServerEvent('cb_airdrop:server:dropFailed')
-            return
-        end
-
-        SetEntityAsMissionEntity(aircraft, true, true)
-        SetVehicleEngineOn(aircraft, true, true, false)
-        SetEntityInvincible(aircraft, true)
-        SetVehicleForwardSpeed(aircraft, Config.PlaneSpeed)
-
-        pilot = CreatePedInsideVehicle(aircraft, 4, pilotModel, -1, true, true)
-        if pilot and pilot ~= 0 then
-            SetEntityInvincible(pilot, true)
-            SetBlockingOfNonTemporaryEvents(pilot, true)
-        end
-
-        notify(Config.Notifications.planeArriving, 'inform')
-
-        local timeout = GetGameTimer() + Config.PlaneTimeoutSeconds * 1000
-        while DoesEntityExist(aircraft) and GetGameTimer() < timeout do
-            local coords = GetEntityCoords(aircraft)
-            if #(coords - zone.coords) <= 70.0 then break end
-            SetVehicleForwardSpeed(aircraft, Config.PlaneSpeed)
-            Wait(250)
-        end
-
-        if not DoesEntityExist(aircraft) then
-            TriggerServerEvent('cb_airdrop:server:dropFailed')
-            return
-        end
-
-        local releaseCoords = GetOffsetFromEntityInWorldCoords(aircraft, 0.0, -2.0, -2.0)
-        crate = CreateObject(crateModel, releaseCoords.x, releaseCoords.y, releaseCoords.z, true, true, true)
-        if crate == 0 then
-            TriggerServerEvent('cb_airdrop:server:dropFailed')
-            return
-        end
-
-        SetEntityAsMissionEntity(crate, true, true)
-        ActivatePhysics(crate)
-
-        local freeFallEnd = GetGameTimer() + Config.CrateFreeFallSeconds * 1000
-        while DoesEntityExist(crate) and GetGameTimer() < freeFallEnd do
-            SetEntityVelocity(crate, 0.0, 0.0, -2.0)
-            Wait(0)
-        end
-
-        parachute = CreateObject(parachuteModel, releaseCoords.x, releaseCoords.y, releaseCoords.z, true, true, true)
-        if parachute and parachute ~= 0 then
-            AttachEntityToEntity(parachute, crate, 0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, false, false, false, false, 2, true)
-            ActivatePhysics(parachute)
-        else
-            parachute = nil
-        end
-
-        local landed = false
-        local landingTimeout = GetGameTimer() + Config.CrateLandingTimeoutSeconds * 1000
-
-        while DoesEntityExist(crate) and GetGameTimer() < landingTimeout do
-            local coords = GetEntityCoords(crate)
-            local found, groundZ = getGroundZ(coords)
-            if found then
-                local targetZ = groundZ + Config.CrateGroundDistance
-                if coords.z <= targetZ + 0.75 then
-                    SetEntityCoords(crate, coords.x, coords.y, targetZ, false, false, false, false)
-                    SetEntityVelocity(crate, 0.0, 0.0, 0.0)
-                    FreezeEntityPosition(crate, true)
-                    landed = true
-                    break
-                end
-            end
-
-            local velocity = GetEntityVelocity(crate)
-            SetEntityVelocity(crate, velocity.x * 0.90, velocity.y * 0.90, -Config.CrateDescentSpeed)
-            Wait(50)
-        end
-
-        if not landed or not DoesEntityExist(crate) then
-            TriggerServerEvent('cb_airdrop:server:dropFailed')
-            return
-        end
-
-        if DoesEntityExist(parachute) then
-            DetachEntity(parachute, true, true)
-            DeleteEntity(parachute)
-            parachute = nil
-        end
-
-        -- CRITICAL: no replacement prop. This exact crate becomes the target.
-        pickup = crate
-        crate = nil
-
-        pickupNetId = getNetworkId(pickup)
-        if pickupNetId <= 0 then
-            TriggerServerEvent('cb_airdrop:server:dropFailed')
-            return
-        end
-
-        local finalCoords = GetEntityCoords(pickup)
-        TriggerServerEvent('cb_airdrop:server:dropReady', {
-            x = finalCoords.x,
-            y = finalCoords.y,
-            z = finalCoords.z
-        }, pickupNetId)
-
-        if DoesEntityExist(aircraft) then DeleteEntity(aircraft) end
-        if DoesEntityExist(pilot) then DeleteEntity(pilot) end
-        aircraft = nil
-        pilot = nil
-
-        SetModelAsNoLongerNeeded(aircraftModel)
-        SetModelAsNoLongerNeeded(pilotModel)
-        SetModelAsNoLongerNeeded(crateModel)
-        SetModelAsNoLongerNeeded(parachuteModel)
-    end)
-end)
-
-exports('useFlare', function(data, slot)
-    exports.ox_inventory:useItem(data, function(usedData)
-        if usedData then TriggerEvent('cb_airdrop:client:startFlare') end
-    end)
-end)
 
 CreateThread(function()
     Wait(1500)
-    TriggerServerEvent('cb_airdrop:server:requestZone')
+
+    TriggerServerEvent(
+        'cb_airdrop:server:requestZone'
+    )
 end)
 
-AddEventHandler('onResourceStop', function(resourceName)
-    if resourceName ~= GetCurrentResourceName() then return end
-    removeCrateTarget()
-    if DoesEntityExist(pickup) then DeleteEntity(pickup) end
-    if DoesEntityExist(crate) then DeleteEntity(crate) end
-    if DoesEntityExist(parachute) then DeleteEntity(parachute) end
-    if DoesEntityExist(aircraft) then DeleteEntity(aircraft) end
-    if DoesEntityExist(pilot) then DeleteEntity(pilot) end
+
+-- ============================================================================
+-- DROP STATE
+-- ============================================================================
+
+RegisterNetEvent(
+    'cb_airdrop:client:setDropState',
+    function(state)
+        dropState = state
+
+        if state == 'idle' then
+            dropBlip = removeBlip(dropBlip)
+
+        elseif state == 'incoming' then
+
+        elseif state == 'ready' then
+            notify(
+                Config.Notifications.crateReady,
+                'success'
+            )
+
+        elseif state == 'claimed' then
+            dropBlip = removeBlip(dropBlip)
+
+        elseif state == 'failed' then
+            dropBlip = removeBlip(dropBlip)
+
+            notify(
+                Config.Notifications.planeCrashed,
+                'error'
+            )
+        end
+    end
+)
+
+
+RegisterNetEvent(
+    'cb_airdrop:client:setDropBlip',
+    function(coords)
+        if not coords then
+            return
+        end
+
+        createDropBlip(coords)
+    end
+)
+
+
+-- ============================================================================
+-- OX INVENTORY ITEM
+-- ============================================================================
+
+exports('useFlare', function(data, slot)
+    exports.ox_inventory:useItem(
+        data,
+        function(usedData)
+            if not usedData then
+                return
+            end
+
+            TriggerEvent(
+                'cb_airdrop:client:startFlare'
+            )
+        end
+    )
 end)
+
+
+-- ============================================================================
+-- FLARE ITEM
+-- ============================================================================
+
+RegisterNetEvent(
+    'cb_airdrop:client:startFlare',
+    function()
+        if dropState ~= 'incoming' then
+            dropState = 'incoming'
+        end
+
+        local ped = PlayerPedId()
+        local coords = GetEntityCoords(ped)
+
+        local flareWeapon =
+            joaat('WEAPON_FLARE')
+
+        RequestWeaponAsset(
+            flareWeapon,
+            31,
+            0
+        )
+
+        local timeout =
+            GetGameTimer() + 5000
+
+        while not HasWeaponAssetLoaded(flareWeapon) do
+            Wait(10)
+
+            if GetGameTimer() >= timeout then
+                print(
+                    '[cb_airdrop] Failed to load flare weapon asset.'
+                )
+
+                return
+            end
+        end
+
+        ShootSingleBulletBetweenCoords(
+            coords,
+            coords - vector3(
+                0.0,
+                0.0,
+                0.1
+            ),
+            0,
+            true,
+            flareWeapon,
+            ped,
+            true,
+            false,
+            1.0
+        )
+
+        RemoveWeaponAsset(
+            flareWeapon
+        )
+
+        notify(
+            Config.Notifications.planeIncoming,
+            'warning'
+        )
+
+        CreateThread(function()
+            local finishTime =
+                GetGameTimer() +
+                (
+                    Config.PlaneArrivalSeconds or 10
+                ) * 1000
+
+            while GetGameTimer() < finishTime do
+                Wait(0)
+
+                local remaining =
+                    math.ceil(
+                        (
+                            finishTime -
+                            GetGameTimer()
+                        ) / 1000
+                    )
+
+                SetTextFont(4)
+                SetTextProportional(0)
+                SetTextScale(
+                    0.45,
+                    0.45
+                )
+
+                SetTextColour(
+                    255,
+                    255,
+                    255,
+                    255
+                )
+
+                SetTextCentre(true)
+                SetTextOutline()
+
+                BeginTextCommandDisplayText(
+                    'STRING'
+                )
+
+                AddTextComponentSubstringPlayerName(
+                    (
+                        '~r~AIR DROP~s~ | Aircraft arrival: ~y~%s~s~'
+                    ):format(
+                        remaining
+                    )
+                )
+
+                EndTextCommandDisplayText(
+                    0.5,
+                    0.82
+                )
+            end
+
+            if dropState == 'incoming' then
+                CrateDrop()
+            end
+        end)
+    end
+)
+
+
+-- ============================================================================
+-- AIRCRAFT / CRATE DROP
+-- ============================================================================
+
+function CrateDrop()
+    if not currentZone then
+        TriggerServerEvent(
+            'cb_airdrop:server:dropFailed'
+        )
+
+        return
+    end
+
+    if dropState ~= 'incoming' then
+        return
+    end
+
+    local aircraftModel =
+        requestModel(
+            Config.AircraftModel
+        )
+
+    local pilotModel =
+        requestModel(
+            Config.PilotModel
+        )
+
+    local crateModel =
+        requestModel(
+            Config.CrateModel
+        )
+
+    local parachuteModel =
+        requestModel(
+            Config.ParachuteModel
+        )
+
+    if not aircraftModel
+        or not pilotModel
+        or not crateModel
+        or not parachuteModel then
+
+        TriggerServerEvent(
+            'cb_airdrop:server:dropFailed'
+        )
+
+        releaseModels()
+
+        return
+    end
+
+    local dropCoords =
+        currentZone.coords
+
+    -- ========================================================================
+    -- FLIGHT DIRECTION
+    -- ========================================================================
+
+    local heading =
+        math.random(0, 359) + 0.0
+
+    local angle =
+        math.rad(heading)
+
+    local direction = vector3(
+        math.cos(angle),
+        math.sin(angle),
+        0.0
+    )
+
+    local spawnDistance =
+        getPlaneSpawnDistance()
+
+    local altitude =
+        getDropHeight()
+
+    local spawnCoords = vector3(
+        dropCoords.x -
+            direction.x *
+            spawnDistance,
+
+        dropCoords.y -
+            direction.y *
+            spawnDistance,
+
+        dropCoords.z +
+            altitude
+    )
+
+    -- ========================================================================
+    -- AIRCRAFT
+    -- ========================================================================
+
+    aircraft = CreateVehicle(
+        aircraftModel,
+        spawnCoords.x,
+        spawnCoords.y,
+        spawnCoords.z,
+        heading,
+        true,
+        true
+    )
+
+    if not DoesEntityExist(aircraft) then
+        TriggerServerEvent(
+            'cb_airdrop:server:dropFailed'
+        )
+
+        releaseModels()
+
+        return
+    end
+
+    SetEntityAsMissionEntity(
+        aircraft,
+        true,
+        true
+    )
+
+    SetVehicleDoorsLocked(
+        aircraft,
+        2
+    )
+
+    SetEntityInvincible(
+        aircraft,
+        true
+    )
+
+    SetVehicleEngineOn(
+        aircraft,
+        true,
+        true,
+        false
+    )
+
+    SetEntityHeading(
+        aircraft,
+        heading
+    )
+
+    SetVehicleForwardSpeed(
+        aircraft,
+        getPlaneSpeed()
+    )
+
+    -- ========================================================================
+    -- PILOT
+    -- ========================================================================
+
+    pilot = CreatePedInsideVehicle(
+        aircraft,
+        4,
+        pilotModel,
+        -1,
+        true,
+        true
+    )
+
+    if not DoesEntityExist(pilot) then
+        CleanupDropEntities()
+
+        TriggerServerEvent(
+            'cb_airdrop:server:dropFailed'
+        )
+
+        releaseModels()
+
+        return
+    end
+
+    SetEntityAsMissionEntity(
+        pilot,
+        true,
+        true
+    )
+
+    SetBlockingOfNonTemporaryEvents(
+        pilot,
+        true
+    )
+
+    SetPedKeepTask(
+        pilot,
+        true
+    )
+
+    SetPedCanRagdoll(
+        pilot,
+        false
+    )
+
+    SetEntityInvincible(
+        pilot,
+        true
+    )
+
+    -- ========================================================================
+    -- AIRCRAFT APPROACH
+    -- ========================================================================
+
+    TaskVehicleDriveToCoord(
+        pilot,
+        aircraft,
+        dropCoords.x,
+        dropCoords.y,
+        dropCoords.z + altitude,
+        getPlaneSpeed(),
+        0,
+        aircraftModel,
+        262144,
+        20.0,
+        -1.0
+    )
+
+    local timeout =
+        GetGameTimer() +
+        (getPlaneTimeout() * 1000)
+
+    local planeReachedDrop = false
+
+    while DoesEntityExist(aircraft)
+        and DoesEntityExist(pilot)
+        and not IsEntityDead(pilot) do
+
+        Wait(100)
+
+        local planeCoords =
+            GetEntityCoords(aircraft)
+
+        local horizontalDistance =
+            #(vector2(
+                planeCoords.x,
+                planeCoords.y
+            ) - vector2(
+                dropCoords.x,
+                dropCoords.y
+            ))
+
+        local altitudeDifference =
+            math.abs(
+                planeCoords.z -
+                (
+                    dropCoords.z +
+                    altitude
+                )
+            )
+
+        if horizontalDistance <= 25.0
+            and altitudeDifference <= 80.0 then
+
+            planeReachedDrop = true
+
+            break
+        end
+
+        if GetGameTimer() >= timeout then
+            CleanupDropEntities()
+
+            TriggerServerEvent(
+                'cb_airdrop:server:dropFailed'
+            )
+
+            releaseModels()
+
+            return
+        end
+    end
+
+    if not planeReachedDrop then
+        CleanupDropEntities()
+
+        TriggerServerEvent(
+            'cb_airdrop:server:dropFailed'
+        )
+
+        releaseModels()
+
+        return
+    end
+
+    -- ========================================================================
+    -- RELEASE POINT
+    -- ========================================================================
+
+    local releaseCoords =
+        GetEntityCoords(aircraft)
+
+    local releaseHeight =
+        releaseCoords.z - 6.0
+
+    local crateCoords = vector3(
+        releaseCoords.x,
+        releaseCoords.y,
+        releaseHeight
+    )
+
+    local releaseDistance =
+        #(vector2(
+            crateCoords.x,
+            crateCoords.y
+        ) - vector2(
+            dropCoords.x,
+            dropCoords.y
+        ))
+
+    if releaseDistance > 35.0 then
+        crateCoords = vector3(
+            dropCoords.x,
+            dropCoords.y,
+            releaseHeight
+        )
+    end
+
+    -- ========================================================================
+    -- CRATE
+    -- ========================================================================
+
+    crate = CreateObject(
+        crateModel,
+        crateCoords.x,
+        crateCoords.y,
+        crateCoords.z,
+        true,
+        true,
+        true
+    )
+
+    if not DoesEntityExist(crate) then
+        CleanupDropEntities()
+
+        TriggerServerEvent(
+            'cb_airdrop:server:dropFailed'
+        )
+
+        releaseModels()
+
+        return
+    end
+
+    SetEntityAsMissionEntity(
+        crate,
+        true,
+        true
+    )
+
+    FreezeEntityPosition(
+        crate,
+        false
+    )
+
+    SetEntityCollision(
+        crate,
+        true,
+        true
+    )
+
+    ActivatePhysics(
+        crate
+    )
+
+    -- ========================================================================
+    -- AIRCRAFT LEAVES
+    -- ========================================================================
+
+    local exitDistance = 2500.0
+
+    local exitCoords = vector3(
+        dropCoords.x +
+            direction.x *
+            exitDistance,
+
+        dropCoords.y +
+            direction.y *
+            exitDistance,
+
+        dropCoords.z +
+            altitude +
+            500.0
+    )
+
+    TaskVehicleDriveToCoord(
+        pilot,
+        aircraft,
+        exitCoords.x,
+        exitCoords.y,
+        exitCoords.z,
+        getPlaneSpeed() * 1.15,
+        0,
+        aircraftModel,
+        262144,
+        30.0,
+        -1.0
+    )
+
+    -- ========================================================================
+    -- FREE FALL
+    -- ========================================================================
+
+    local freeFallSeconds =
+        Config.CrateFreeFallSeconds or 1.5
+
+    local freeFallEnd =
+        GetGameTimer() +
+        (
+            freeFallSeconds *
+            1000
+        )
+
+    SetEntityVelocity(
+        crate,
+        0.0,
+        0.0,
+        -8.0
+    )
+
+    while DoesEntityExist(crate)
+        and GetGameTimer() < freeFallEnd do
+
+        Wait(50)
+
+        local coords =
+            GetEntityCoords(crate)
+
+        local foundGround, groundZ =
+            getGroundHeight(
+                coords,
+                crate
+            )
+
+        if foundGround
+            and coords.z <= groundZ + 25.0 then
+
+            break
+        end
+    end
+
+    if not DoesEntityExist(crate) then
+        CleanupDropEntities()
+
+        TriggerServerEvent(
+            'cb_airdrop:server:dropFailed'
+        )
+
+        releaseModels()
+
+        return
+    end
+
+    -- ========================================================================
+    -- PARACHUTE
+    -- ========================================================================
+
+    local crateCurrentCoords =
+        GetEntityCoords(crate)
+
+    parachute = CreateObject(
+        parachuteModel,
+        crateCurrentCoords.x,
+        crateCurrentCoords.y,
+        crateCurrentCoords.z + 5.0,
+        true,
+        true,
+        true
+    )
+
+    if not DoesEntityExist(parachute) then
+        CleanupDropEntities()
+
+        TriggerServerEvent(
+            'cb_airdrop:server:dropFailed'
+        )
+
+        releaseModels()
+
+        return
+    end
+
+    SetEntityAsMissionEntity(
+        parachute,
+        true,
+        true
+    )
+
+    SetEntityCollision(
+        parachute,
+        false,
+        false
+    )
+
+    AttachEntityToEntity(
+        parachute,
+        crate,
+        0,
+        0.0,
+        0.0,
+        5.0,
+        0.0,
+        0.0,
+        0.0,
+        false,
+        false,
+        false,
+        false,
+        2,
+        true
+    )
+
+    -- ========================================================================
+    -- CONTROLLED DESCENT
+    -- ========================================================================
+
+    local descentSpeed =
+        Config.CrateDescentSpeed or 5.5
+
+    local landingTimeout =
+        GetGameTimer() +
+        (
+            Config.CrateLandingTimeoutSeconds or 90
+        ) * 1000
+
+    local landed = false
+    local landingCoords = nil
+
+    while DoesEntityExist(crate) do
+        Wait(50)
+
+        local coords =
+            GetEntityCoords(crate)
+
+        local foundGround, groundZ =
+            getGroundHeight(
+                coords,
+                crate
+            )
+
+        if foundGround then
+            local targetZ =
+                groundZ +
+                getModelGroundOffset(
+                    Config.CrateModel
+                ) +
+                getGroundDistance()
+
+            local distanceToGround =
+                coords.z - targetZ
+
+            if distanceToGround <= 0.10 then
+                SetEntityCoordsNoOffset(
+                    crate,
+                    coords.x,
+                    coords.y,
+                    targetZ,
+                    false,
+                    false,
+                    false
+                )
+
+                SetEntityVelocity(
+                    crate,
+                    0.0,
+                    0.0,
+                    0.0
+                )
+
+                FreezeEntityPosition(
+                    crate,
+                    true
+                )
+
+                landingCoords =
+                    vector3(
+                        coords.x,
+                        coords.y,
+                        targetZ
+                    )
+
+                landed = true
+
+                break
+            end
+
+            local step =
+                descentSpeed * 0.05
+
+            if distanceToGround < 3.0 then
+                step =
+                    math.min(
+                        step,
+                        math.max(
+                            distanceToGround * 0.35,
+                            0.015
+                        )
+                    )
+            end
+
+            step =
+                math.min(
+                    step,
+                    distanceToGround
+                )
+
+            local nextZ =
+                coords.z - step
+
+            SetEntityCoordsNoOffset(
+                crate,
+                coords.x,
+                coords.y,
+                nextZ,
+                false,
+                false,
+                false
+            )
+
+            SetEntityVelocity(
+                crate,
+                0.0,
+                0.0,
+                0.0
+            )
+        else
+            local nextZ =
+                coords.z -
+                (
+                    descentSpeed *
+                    0.05
+                )
+
+            SetEntityCoordsNoOffset(
+                crate,
+                coords.x,
+                coords.y,
+                nextZ,
+                false,
+                false,
+                false
+            )
+
+            SetEntityVelocity(
+                crate,
+                0.0,
+                0.0,
+                0.0
+            )
+        end
+
+        if GetGameTimer() >= landingTimeout then
+            break
+        end
+    end
+
+    -- =========================================================================
+    -- FINAL LANDING VALIDATION
+    -- =========================================================================
+
+    if not landed and DoesEntityExist(crate) then
+        local coords =
+            GetEntityCoords(crate)
+
+        local foundGround, groundZ =
+            getGroundHeight(
+                coords,
+                crate
+            )
+
+        if foundGround then
+            local targetZ =
+                groundZ +
+                getModelGroundOffset(
+                    Config.CrateModel
+                ) +
+                getGroundDistance()
+
+            if math.abs(coords.z - targetZ) <= 0.25 then
+                SetEntityCoordsNoOffset(
+                    crate,
+                    coords.x,
+                    coords.y,
+                    targetZ,
+                    false,
+                    false,
+                    false
+                )
+
+                SetEntityVelocity(
+                    crate,
+                    0.0,
+                    0.0,
+                    0.0
+                )
+
+                FreezeEntityPosition(
+                    crate,
+                    true
+                )
+
+                landingCoords =
+                    vector3(
+                        coords.x,
+                        coords.y,
+                        targetZ
+                    )
+
+                landed = true
+            end
+        end
+    end
+
+    if not landed or not landingCoords then
+        CleanupDropEntities()
+
+        TriggerServerEvent(
+            'cb_airdrop:server:dropFailed'
+        )
+
+        releaseModels()
+
+        return
+    end
+
+    -- =========================================================================
+    -- PARACHUTE DETACH
+    -- =========================================================================
+
+    if DoesEntityExist(parachute) then
+        DetachEntity(
+            parachute,
+            true,
+            true
+        )
+
+        DeleteEntity(
+            parachute
+        )
+
+        parachute = nil
+    end
+
+    -- =========================================================================
+    -- FINAL CRATE POSITION
+    -- =========================================================================
+
+    if DoesEntityExist(crate) then
+        local coords =
+            GetEntityCoords(crate)
+
+        local foundGround, groundZ =
+            getGroundHeight(
+                coords,
+                crate
+            )
+
+        if foundGround then
+            local finalZ =
+                groundZ +
+                getModelGroundOffset(
+                    Config.CrateModel
+                ) +
+                getGroundDistance()
+
+            if math.abs(coords.z - finalZ) <= 0.25 then
+                SetEntityCoordsNoOffset(
+                    crate,
+                    coords.x,
+                    coords.y,
+                    finalZ,
+                    false,
+                    false,
+                    false
+                )
+
+                landingCoords =
+                    vector3(
+                        coords.x,
+                        coords.y,
+                        finalZ
+                    )
+            end
+        end
+
+        SetEntityVelocity(
+            crate,
+            0.0,
+            0.0,
+            0.0
+        )
+
+        FreezeEntityPosition(
+            crate,
+            true
+        )
+    end
+
+    -- =========================================================================
+    -- FINAL PICKUP ENTITY
+    -- =========================================================================
+    --
+    -- The crate that descended with the parachute remains the exact same
+    -- entity after landing.
+    --
+
+    pickup = crate
+    crate = nil
+
+    if not DoesEntityExist(pickup) then
+        CleanupDropEntities()
+
+        TriggerServerEvent(
+            'cb_airdrop:server:dropFailed'
+        )
+
+        releaseModels()
+
+        return
+    end
+
+    SetEntityAsMissionEntity(
+        pickup,
+        true,
+        true
+    )
+
+    FreezeEntityPosition(
+        pickup,
+        true
+    )
+
+    SetEntityCollision(
+        pickup,
+        true,
+        true
+    )
+
+    -- =========================================================================
+    -- OX TARGET - ACTUAL CRATE ENTITY
+    -- =========================================================================
+    --
+    -- NO SPHERE ZONE.
+    --
+    -- The physical crate itself is the target.
+    --
+
+    if not registerPickupTarget(pickup) then
+        CleanupDropEntities()
+
+        TriggerServerEvent(
+            'cb_airdrop:server:dropFailed'
+        )
+
+        releaseModels()
+
+        return
+    end
+
+    -- =========================================================================
+    -- DROP READY
+    -- =========================================================================
+
+    TriggerServerEvent(
+        'cb_airdrop:server:dropReady',
+        {
+            x = landingCoords.x,
+            y = landingCoords.y,
+            z = landingCoords.z
+        }
+    )
+
+    TriggerEvent(
+        'cb_airdrop:client:setDropBlip',
+        landingCoords
+    )
+
+    -- =========================================================================
+    -- AIRCRAFT CLEANUP
+    -- =========================================================================
+
+    local aircraftToCleanup = aircraft
+    local pilotToCleanup = pilot
+
+    aircraft = nil
+    pilot = nil
+
+    CreateThread(function()
+        local cleanupTimeout =
+            GetGameTimer() + 90000
+
+        while GetGameTimer() < cleanupTimeout do
+            Wait(1000)
+
+            if not DoesEntityExist(
+                aircraftToCleanup
+            ) then
+                break
+            end
+
+            local planeCoords =
+                GetEntityCoords(
+                    aircraftToCleanup
+                )
+
+            local distance =
+                #(vector2(
+                    planeCoords.x,
+                    planeCoords.y
+                ) - vector2(
+                    dropCoords.x,
+                    dropCoords.y
+                ))
+
+            if distance >= 1800.0 then
+                break
+            end
+        end
+
+        if DoesEntityExist(
+            pilotToCleanup
+        ) then
+            DeleteEntity(
+                pilotToCleanup
+            )
+        end
+
+        if DoesEntityExist(
+            aircraftToCleanup
+        ) then
+            DeleteEntity(
+                aircraftToCleanup
+            )
+        end
+    end)
+
+    releaseModels()
+end
+
+
+-- ============================================================================
+-- LOOT
+-- ============================================================================
+
+function StartLoot(entity)
+    if dropState ~= 'ready' then
+        return
+    end
+
+    if entity
+        and entity ~= 0
+        and DoesEntityExist(entity) then
+
+        if pickup
+            and DoesEntityExist(pickup)
+            and entity ~= pickup then
+
+            return
+        end
+    end
+
+    if not pickupNetId then
+        return
+    end
+
+    local accepted =
+        lib.callback.await(
+            'cb_airdrop:server:beginLoot',
+            false
+        )
+
+    if not accepted then
+        notify(
+            Config.Notifications.crateAlreadyLooted,
+            'error'
+        )
+
+        return
+    end
+
+    local completed =
+        lib.progressBar({
+            duration = Config.LootDuration,
+            label = 'Searching survival supplies...',
+            useWhileDead = false,
+            canCancel = true,
+
+            disable = {
+                move = true,
+                car = true,
+                combat = true,
+                sprint = true
+            },
+
+            anim = {
+                dict =
+                    'anim@amb@clubhouse@tutorial@bkr_tut_ig3@',
+
+                clip =
+                    'machinic_loop_mechandplayer',
+
+                flag = 49
+            }
+        })
+
+    if not completed then
+        TriggerServerEvent(
+            'cb_airdrop:server:cancelLoot'
+        )
+
+        notify(
+            Config.Notifications.lootCancelled,
+            'error'
+        )
+
+        return
+    end
+
+    TriggerServerEvent(
+        'cb_airdrop:server:completeLoot'
+    )
+end
+
+
+-- ============================================================================
+-- DROP REMOVED
+-- ============================================================================
+
+RegisterNetEvent(
+    'cb_airdrop:client:removeDrop',
+    function()
+        dropState = 'claimed'
+
+        dropBlip = removeBlip(
+            dropBlip
+        )
+
+        removePickupTarget()
+
+        if DoesEntityExist(pickup) then
+            DeleteEntity(
+                pickup
+            )
+        end
+
+        pickup = nil
+
+        notify(
+            Config.Notifications.lootSuccess,
+            'success'
+        )
+    end
+)
+
+
+-- ============================================================================
+-- CLEANUP
+-- ============================================================================
+
+function CleanupDropEntities()
+    removePickupTarget()
+
+    if DoesEntityExist(parachute) then
+        DetachEntity(
+            parachute,
+            true,
+            true
+        )
+
+        DeleteEntity(
+            parachute
+        )
+    end
+
+    parachute = nil
+
+    if DoesEntityExist(pickup) then
+        DetachEntity(
+            pickup,
+            true,
+            true
+        )
+
+        DeleteEntity(
+            pickup
+        )
+    end
+
+    pickup = nil
+
+    if DoesEntityExist(crate) then
+        DeleteEntity(
+            crate
+        )
+    end
+
+    crate = nil
+
+    if DoesEntityExist(pilot) then
+        DeleteEntity(
+            pilot
+        )
+    end
+
+    pilot = nil
+
+    if DoesEntityExist(aircraft) then
+        DeleteEntity(
+            aircraft
+        )
+    end
+
+    aircraft = nil
+end
+
+
+-- ============================================================================
+-- RESOURCE STOP
+-- ============================================================================
+
+AddEventHandler(
+    'onResourceStop',
+    function(resourceName)
+        if resourceName ~= GetCurrentResourceName() then
+            return
+        end
+
+        CleanupDropEntities()
+
+        zoneBlip = removeBlip(
+            zoneBlip
+        )
+
+        dropBlip = removeBlip(
+            dropBlip
+        )
+
+        policeBlip = removeBlip(
+            policeBlip
+        )
+    end
+)
