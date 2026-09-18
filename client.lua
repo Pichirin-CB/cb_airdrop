@@ -1,4 +1,3 @@
-
 local currentZone = nil
 
 local zoneBlip = nil
@@ -20,8 +19,6 @@ local requiredModels = {
     Config.PilotModel,
     Config.PickupModel
 }
-
-local targetRegistered = false
 
 -- ============================================================================
 -- HELPERS
@@ -99,6 +96,9 @@ local function getGroundHeight(coords, ignoreEntity)
     local startZ = coords.z + 100.0
     local endZ = coords.z - 1000.0
 
+    -- Only test world geometry.
+    -- This prevents the raycast from detecting the parachute,
+    -- crate or other dynamic entities as the "ground".
     local ray = StartShapeTestRay(
         coords.x,
         coords.y,
@@ -106,7 +106,7 @@ local function getGroundHeight(coords, ignoreEntity)
         coords.x,
         coords.y,
         endZ,
-        511,
+        1,
         ignoreEntity or 0,
         7
     )
@@ -114,12 +114,12 @@ local function getGroundHeight(coords, ignoreEntity)
     local timeout = GetGameTimer() + 1000
 
     while GetGameTimer() < timeout do
-        local result, hit, endCoords, surfaceNormal, entityHit =
+        local result, hit, endCoords =
             GetShapeTestResult(ray)
 
         if result == 2 then
             if hit then
-                return true, endCoords.z, entityHit
+                return true, endCoords.z, 0
             end
 
             break
@@ -156,8 +156,6 @@ local function getModelGroundOffset(model)
         return 0.05
     end
 
-    -- GTA model origin can sit below or above the physical bottom.
-    -- Convert the model's minimum local Z into a world-space ground offset.
     local offset = -minDim.z
 
     if offset < 0.0 then
@@ -165,56 +163,6 @@ local function getModelGroundOffset(model)
     end
 
     return offset + 0.03
-end
-
-
-local function placeEntityOnGround(entity, model)
-    if not DoesEntityExist(entity) then
-        return false, nil
-    end
-
-    local coords =
-        GetEntityCoords(entity)
-
-    local foundGround, groundZ =
-        getGroundHeight(
-            coords,
-            entity
-        )
-
-    if not foundGround then
-        return false, nil
-    end
-
-    local offset =
-        getModelGroundOffset(model)
-
-    local finalZ =
-        groundZ + offset
-
-    SetEntityCoords(
-        entity,
-        coords.x,
-        coords.y,
-        finalZ,
-        false,
-        false,
-        false,
-        false
-    )
-
-    SetEntityVelocity(
-        entity,
-        0.0,
-        0.0,
-        0.0
-    )
-
-    return true, vector3(
-        coords.x,
-        coords.y,
-        finalZ
-    )
 end
 
 
@@ -422,9 +370,6 @@ RegisterNetEvent(
         currentZone = zone
 
         createZoneBlip()
-
-        -- Do NOT create the actual airdrop blip here.
-        -- The drop blip only exists after a flare successfully requests one.
     end
 )
 
@@ -451,8 +396,6 @@ RegisterNetEvent(
             dropBlip = removeBlip(dropBlip)
 
         elseif state == 'incoming' then
-            -- The actual drop blip is created when the server sends
-            -- the requested drop coordinates.
 
         elseif state == 'ready' then
             notify(
@@ -611,7 +554,7 @@ RegisterNetEvent(
 
                 AddTextComponentSubstringPlayerName(
                     (
-                        '~r~AIR DROP~s~ | Aircraft arrival: ~y~%s~s~s'
+                        '~r~AIR DROP~s~ | Aircraft arrival: ~y~%s~s~'
                     ):format(
                         remaining
                     )
@@ -999,62 +942,6 @@ function CrateDrop()
     )
 
     -- ========================================================================
-    -- PICKUP
-    -- ========================================================================
-
-    pickup = CreateObject(
-        pickupModel,
-        crateCoords.x,
-        crateCoords.y,
-        crateCoords.z,
-        true,
-        true,
-        true
-    )
-
-    if not DoesEntityExist(pickup) then
-        CleanupDropEntities()
-
-        TriggerServerEvent(
-            'cb_airdrop:server:dropFailed'
-        )
-
-        releaseModels()
-
-        return
-    end
-
-    SetEntityAsMissionEntity(
-        pickup,
-        true,
-        true
-    )
-
-    SetEntityCollision(
-        pickup,
-        false,
-        false
-    )
-
-    AttachEntityToEntity(
-        pickup,
-        crate,
-        0,
-        0.0,
-        0.0,
-        0.35,
-        0.0,
-        0.0,
-        0.0,
-        false,
-        false,
-        false,
-        false,
-        2,
-        true
-    )
-
-    -- ========================================================================
     -- AIRCRAFT LEAVES
     -- ========================================================================
 
@@ -1223,6 +1110,9 @@ function CrateDrop()
         local coords =
             GetEntityCoords(crate)
 
+        -- IMPORTANT:
+        -- getGroundHeight only raycasts against world geometry.
+        -- The parachute cannot be mistaken for the ground.
         local foundGround, groundZ =
             getGroundHeight(
                 coords,
@@ -1240,7 +1130,7 @@ function CrateDrop()
             local distanceToGround =
                 coords.z - targetZ
 
-            if distanceToGround <= 0.75 then
+            if distanceToGround <= 1.0 then
                 SetEntityCoords(
                     crate,
                     coords.x,
@@ -1277,13 +1167,13 @@ function CrateDrop()
             end
 
             local delta =
-                descentSpeed * 0.05
+                math.min(
+                    descentSpeed * 0.05,
+                    distanceToGround
+                )
 
             local nextZ =
-                math.max(
-                    targetZ,
-                    coords.z - delta
-                )
+                coords.z - delta
 
             SetEntityCoordsNoOffset(
                 crate,
@@ -1465,74 +1355,6 @@ function CrateDrop()
         )
     end
 
-    -- ========================================================================
-    -- PREPARE PICKUP
-    -- ========================================================================
-
-    if DoesEntityExist(pickup)
-        and DoesEntityExist(crate) then
-
-        DetachEntity(
-            pickup,
-            true,
-            true
-        )
-
-        local foundGround, groundZ =
-            getGroundHeight(
-                landingCoords,
-                pickup
-            )
-
-        if foundGround then
-            local pickupZ =
-                groundZ +
-                getModelGroundOffset(
-                    Config.PickupModel
-                )
-
-            SetEntityCoords(
-                pickup,
-                landingCoords.x,
-                landingCoords.y,
-                pickupZ,
-                false,
-                false,
-                false,
-                false
-            )
-
-            landingCoords =
-                vector3(
-                    landingCoords.x,
-                    landingCoords.y,
-                    pickupZ
-                )
-        else
-            SetEntityCoords(
-                pickup,
-                landingCoords.x,
-                landingCoords.y,
-                landingCoords.z,
-                false,
-                false,
-                false,
-                false
-            )
-        end
-
-        SetEntityCollision(
-            pickup,
-            true,
-            true
-        )
-
-        FreezeEntityPosition(
-            pickup,
-            true
-        )
-    end
-
     -- =========================================================================
     -- REMOVE PHYSICAL CRATE
     -- =========================================================================
@@ -1541,6 +1363,135 @@ function CrateDrop()
         DeleteEntity(crate)
         crate = nil
     end
+
+    -- =========================================================================
+    -- CREATE FINAL PICKUP
+    -- =========================================================================
+
+    pickup = CreateObject(
+        pickupModel,
+        landingCoords.x,
+        landingCoords.y,
+        landingCoords.z,
+        true,
+        true,
+        true
+    )
+
+    if not DoesEntityExist(pickup) then
+        CleanupDropEntities()
+
+        TriggerServerEvent(
+            'cb_airdrop:server:dropFailed'
+        )
+
+        releaseModels()
+
+        return
+    end
+
+    SetEntityAsMissionEntity(
+        pickup,
+        true,
+        true
+    )
+
+    -- Make sure the pickup itself is positioned against the actual ground.
+    local pickupCoords =
+        GetEntityCoords(pickup)
+
+    local foundPickupGround, pickupGroundZ =
+        getGroundHeight(
+            landingCoords,
+            pickup
+        )
+
+    if foundPickupGround then
+        local pickupZ =
+            pickupGroundZ +
+            getModelGroundOffset(
+                Config.PickupModel
+            )
+
+        SetEntityCoords(
+            pickup,
+            landingCoords.x,
+            landingCoords.y,
+            pickupZ,
+            false,
+            false,
+            false,
+            false
+        )
+    else
+        SetEntityCoords(
+            pickup,
+            landingCoords.x,
+            landingCoords.y,
+            landingCoords.z,
+            false,
+            false,
+            false,
+            false
+        )
+    end
+
+    SetEntityCollision(
+        pickup,
+        true,
+        true
+    )
+
+    FreezeEntityPosition(
+        pickup,
+        true
+    )
+
+    -- =========================================================================
+    -- OX TARGET - LOCAL PICKUP ONLY
+    -- =========================================================================
+
+    exports.ox_target:addLocalEntity(
+        pickup,
+        {
+            {
+                name = 'cb_airdrop_loot',
+                icon = 'fa-solid fa-box-open',
+                iconColor = '#c9a227',
+                label = 'Search supply crate',
+                distance = Config.LootDistance,
+
+                canInteract = function(
+                    entity,
+                    distance
+                )
+                    if dropState ~= 'ready' then
+                        return false
+                    end
+
+                    if not DoesEntityExist(entity) then
+                        return false
+                    end
+
+                    if entity ~= pickup then
+                        return false
+                    end
+
+                    if distance > Config.LootDistance then
+                        return false
+                    end
+
+                    return true
+                end,
+
+                onSelect = function(data)
+                    StartLoot(
+                        data.entity
+                    )
+                end
+            }
+        }
+    )
 
     -- =========================================================================
     -- DROP READY
@@ -1624,57 +1575,6 @@ end
 
 
 -- ============================================================================
--- OX TARGET
--- ============================================================================
-
-CreateThread(function()
-    exports.ox_target:addModel(
-        Config.PickupModel,
-        {
-            {
-                name = 'cb_airdrop_loot',
-                icon = 'fa-solid fa-box-open',
-                iconColor = '#c9a227',
-                label = 'Search supply crate',
-                distance = Config.LootDistance,
-
-                canInteract = function(
-                    entity,
-                    distance
-                )
-                    if dropState ~= 'ready' then
-                        return false
-                    end
-
-                    if not DoesEntityExist(entity) then
-                        return false
-                    end
-
-                    if distance > Config.LootDistance then
-                        return false
-                    end
-
-                    if not currentZone then
-                        return false
-                    end
-
-                    return true
-                end,
-
-                onSelect = function(data)
-                    StartLoot(
-                        data.entity
-                    )
-                end
-            }
-        }
-    )
-
-    targetRegistered = true
-end)
-
-
--- ============================================================================
 -- LOOT
 -- ============================================================================
 
@@ -1684,6 +1584,10 @@ function StartLoot(entity)
     end
 
     if not DoesEntityExist(entity) then
+        return
+    end
+
+    if entity ~= pickup then
         return
     end
 
@@ -1760,6 +1664,11 @@ RegisterNetEvent(
         )
 
         if DoesEntityExist(pickup) then
+            exports.ox_target:removeLocalEntity(
+                pickup,
+                'cb_airdrop_loot'
+            )
+
             DeleteEntity(
                 pickup
             )
@@ -1795,6 +1704,11 @@ function CleanupDropEntities()
     parachute = nil
 
     if DoesEntityExist(pickup) then
+        exports.ox_target:removeLocalEntity(
+            pickup,
+            'cb_airdrop_loot'
+        )
+
         DetachEntity(
             pickup,
             true,
