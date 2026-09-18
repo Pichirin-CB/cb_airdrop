@@ -3,7 +3,7 @@ game 'gta5'
 
 name 'cb_airdrop'
 author 'Pichirin_CB'
-description 'Apocalyptic airdrop system with direct physical crate ox_target interaction.'
+description 'Apocalyptic air drop system for FiveM with supply crates, random loot, weapons, flare signals and configurable drop zones.'
 version '3.0.0'
 license ''
 documentation 'https://docs.pichirincb.com/#/'
@@ -22,4 +22,5 @@ shared_scripts {
 }
 
 client_script 'client.lua'
+
 server_script 'server.lua'

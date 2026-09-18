@@ -1,3 +1,4 @@
+
 local ESX = exports['es_extended']:getSharedObject()
 local oxInventory = exports.ox_inventory
 
@@ -10,8 +11,6 @@ local currentZone = nil
 local dropState = 'idle'
 
 local dropCoords = nil
-
-local dropNetId = nil
 
 local cooldownUntil = 0
 
@@ -144,6 +143,7 @@ local function isValidDropPosition(coords)
     local distance =
         #(coords - currentZone.coords)
 
+    -- The crate must remain inside the configured active zone.
     return distance <=
         (
             currentZone.radius +
@@ -157,21 +157,6 @@ local function broadcastState()
         'cb_airdrop:client:setDropState',
         -1,
         dropState
-    )
-end
-
-
-local function broadcastCrateTarget()
-    if not dropNetId
-        or dropNetId == 0 then
-
-        return
-    end
-
-    TriggerClientEvent(
-        'cb_airdrop:client:registerCrateTarget',
-        -1,
-        dropNetId
     )
 end
 
@@ -381,14 +366,6 @@ RegisterNetEvent(
                 source,
                 dropCoords
             )
-
-            if dropNetId then
-                TriggerClientEvent(
-                    'cb_airdrop:client:registerCrateTarget',
-                    source,
-                    dropNetId
-                )
-            end
         end
     end
 )
@@ -543,8 +520,6 @@ exports('useFlare', function(
             currentZone.coords.z
         )
 
-    dropNetId = nil
-
     lootClaimer = nil
 
     setDropState('incoming')
@@ -572,7 +547,7 @@ end)
 
 RegisterNetEvent(
     'cb_airdrop:server:dropReady',
-    function(coords, netId)
+    function(coords)
         local source = source
 
         if dropState ~= 'incoming' then
@@ -607,26 +582,8 @@ RegisterNetEvent(
             return
         end
 
-        local finalNetId =
-            tonumber(netId)
-
-        if not finalNetId
-            or finalNetId <= 0 then
-
-            debugPrint(
-                (
-                    'Rejected airdrop ready event from player %s because the crate network ID is invalid.'
-                ):format(source)
-            )
-
-            return
-        end
-
         dropCoords =
             finalCoords
-
-        dropNetId =
-            finalNetId
 
         setDropState('ready')
 
@@ -636,16 +593,13 @@ RegisterNetEvent(
             dropCoords
         )
 
-        broadcastCrateTarget()
-
         debugPrint(
             (
-                'Airdrop ready at %.2f %.2f %.2f. Crate NetID: %s.'
+                'Airdrop ready at %.2f %.2f %.2f.'
             ):format(
                 dropCoords.x,
                 dropCoords.y,
-                dropCoords.z,
-                tostring(dropNetId)
+                dropCoords.z
             )
         )
     end
@@ -664,10 +618,7 @@ RegisterNetEvent(
         end
 
         lootClaimer = nil
-
         dropCoords = nil
-
-        dropNetId = nil
 
         setDropState('failed')
 
@@ -704,10 +655,6 @@ lib.callback.register(
         end
 
         if not dropCoords then
-            return false
-        end
-
-        if not dropNetId then
             return false
         end
 
@@ -927,8 +874,6 @@ RegisterNetEvent(
 
             dropCoords = nil
 
-            dropNetId = nil
-
             if dropState == 'claimed' then
                 setDropState('idle')
             end
@@ -975,7 +920,5 @@ AddEventHandler(
         end
 
         removePoliceAlerts()
-
-        dropNetId = nil
     end
 )
